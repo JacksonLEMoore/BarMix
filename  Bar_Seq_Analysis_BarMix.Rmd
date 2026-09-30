@@ -1,0 +1,515 @@
+---
+title: "Chemogenomic profiling of diverse
+Saccharomyces cerevisiae strains using the novel CRISPR-Cas9 markerless
+barcoded library BarMix"
+author: "Jackson Moore, Marjan Barazandeh, Corey Nislow, Vivien Measday"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+params:
+  run_analysis: false
+---
+
+This code accompanies the manuscript *Chemogenomic profiling of diverse
+Saccharomyces cerevisiae strains using the novel CRISPR-Cas9 markerless
+barcoded library BarMix*.
+
+## Overview and requirements
+
+The workflow creates a barcode reference, maps paired-end sequencing reads,
+counts barcode overlaps, estimates strain fitness, and generates exploratory
+plots.
+
+Place this document in the project directory alongside:
+
+- `Additional File 1 - Supplemental Tables.xlsx`: strain/barcode/clade information
+  in sheet 1 and compound information in sheet 2
+- `BarSeq_Directory/`: paired FASTQ files
+
+Required command-line tools: BWA, SAMtools, and BEDTools. Required R packages:
+`readxl`, `tidyverse`, `phylotools`, `ggsignif`, `pheatmap`, `Hmisc`,
+`tidygraph`, `ggraph`, `factoextra`, `knitr`, and `rmarkdown`.
+
+## Load R libraries
+```{r}
+library(readxl)
+library(tidyverse)
+library(phylotools)
+library(ggpubr)
+library(pheatmap)
+library(viridis)
+library(RColorBrewer)
+```
+
+## R: Create the barcode FASTA reference
+
+The following code generates an indexed bed file to be used for mapping barcode sequences to their corresponding strain identity
+
+#R: Create a FASTA file of barcodes
+```{r create-fasta}
+#Read in Table S1 containing barcode amplicon sequences and corresponding strains
+raw_dat <- read_xlsx('Additional File 1 - Supplemental Tables.xlsx', sheet = 1, skip = 2)
+dat <- raw_dat %>% 
+  select(Strain, `Barcode`) 
+dat <- dat %>% 
+  rename("seq.name" = Strain) %>% 
+  rename("seq.text" = Barcode)
+#Convert to fasta file
+dat2fasta(dat, outfile = "Amplicon_Database.fa")
+```
+
+## Terminal (Bash): Index the reference and generate bed file
+
+```{bash index-fasta, eval = FALSE}
+#Index fasta file
+bwa index Amplicon_Database.fa
+#Convert fasta to bed format:
+# Use awk to process the FASTA file and generate a BED file
+awk -v OFS='\t' '/^>/ {if(seqname){print seqname, 1, seqlen, ".", ".", "+"}; seqname=substr($1,2); seqlen=0; next} {seqlen+=length($0)} END{print seqname, 1, seqlen, ".", ".", "+"}' Amplicon_Database.fa > Amplicon_Database.bed
+```
+
+## Terminal (Bash): Map barcode reads to corresponding strains
+
+```{bash bwa-mapping, eval = FALSE}
+#The BarSeq directory should contain all raw fastq files obtained from Bar-seq experiments
+for file in BarSeq_Directory/*_1.fastq
+do
+f=$(basename "$file")
+prefix="${f%_1.fastq}"  # Remove _1.fastq to get the sample name prefix
+paired_end_1="BarSeq_Directory/${prefix}_1.fastq"
+paired_end_2="BarSeq_Directory/${prefix}_2.fastq"
+barcode_database=Amplicon_Database.fa
+
+echo "Running bwa mem on $paired_end_1 and $paired_end_2"
+
+#Perform bwa mapping to generate bam files as output
+bwa mem -t 4 $barcode_database ${paired_end_1} ${paired_end_2} >  BarSeq_Directory/${prefix}.sam
+samtools view -b -o BarSeq_Directory/${prefix}.bam  BarSeq_Directory/${prefix}.sam
+done
+```
+
+## Terminal (Bash): Sort, filter, and count barcode depth per strain
+
+```{bash barcoding-counting, eval = FALSE}
+for file in BarSeq_Directory/*.bam
+do
+f=$(basename "$file")
+prefix="${f%.bam}"  # Remove _1.fastq to get the sample name prefix
+bed_file=Amplicon_Database.bed
+
+echo "Running bwa mem on $prefix"
+
+#Sort bam files
+samtools sort -O bam -o BarSeq_Directory/${prefix}.sorted.bam -T BarSeq_Directory${prefix}_tmp -@ 4 BarSeq_Directory/${prefix}.bam
+#Filter bam files with quality mapping score 30
+samtools view -q 30 -h -b -o BarSeq_Directory/${prefix}.q.bam BarSeq_Directory/${prefix}.sorted.bam
+#index bam files
+samtools index BarSeq_Directory/${prefix}.q.bam
+#Count number of reads per barcode
+coverageBed -a $bed_file -b BarSeq_Directory/${prefix}.q.bam -s > BarSeq_Directory/${prefix}.q_counts.txt
+done
+```
+
+## R: Assemble the raw-count matrix
+
+```{r}
+#Function for reading bwa counts
+read_bwa_counts = function(cf, bwa_out_dir = NULL){
+  # Extract the sample name  of the filename
+  s = paste(unlist(strsplit(x = cf, split = "_"))[3:4], collapse = "_")
+  f = file.path(bwa_out_dir, cf)
+  
+  counts_f = read.table(file = f, header = F, sep = "\t", quote = "", comment.char = "", stringsAsFactors = F)
+  #Extract sample name and count information
+  counts_f1 = counts_f %>% select(V1, V7)
+  
+  counts2 = counts_f1 %>% rename(Strain = V1, counts = V7) 
+  
+  counts4 = counts2 %>% as.data.frame()
+  #Name column with sample name
+  colnames(counts4)[2] = s
+  
+  return(counts4)
+}
+
+#Run function across all Bar-seq data
+counts_dir = file.path("BarSeq_Directory/")
+count_files = dir(path = "BarSeq_Directory/", pattern = "*.counts.txt")
+bwa_counts = NULL
+for(f in count_files){
+  c = read_bwa_counts(cf = f , bwa_out_dir = counts_dir)
+  if(is.null(bwa_counts)){
+    bwa_counts = c
+  } else {
+    bwa_counts = bwa_counts %>% left_join(c)
+  }
+}
+
+#Save csv file of raw counts
+write_csv(bwa_counts, 'Raw_Counts.csv')
+```
+
+## R: Assess correlations between samples
+
+```{r}
+#Read in raw counts data
+bwa_counts <- read_csv('Raw_Counts.csv')
+
+bwa_counts_replicates <- bwa_counts
+
+# Exclude the first column which contains Strain names
+bwa_counts_replicates2 <- bwa_counts_replicates[, -1]
+
+# Calculate pairwise correlation
+cor_matrix <- cor(bwa_counts_replicates2)
+
+# Convert correlation matrix to a dataframe
+cor_df <- as.data.frame(as.table(cor_matrix))
+
+# Rename columns for clarity
+names(cor_df) <- c("Replicate_Condition_1", "Replicate_Condition_2", "Correlation")
+
+#Visualize data via ggplot
+ggplot(cor_df, aes(Replicate_Condition_1, Replicate_Condition_2)) +
+  geom_tile(aes(fill = Correlation)) +
+  geom_text(aes(label = round(Correlation, 2)), size = 1.5) +
+  scale_fill_gradient(low = "red", high = "green", limits=c(0,1)) +
+  xlab("Sample") + 
+  ylab("Sample") +
+    theme(axis.text.x = element_text(angle = 90, size = 4), axis.text.y = element_text(size = 4, face = "bold"), axis.title.x = element_text(size = 20, face = "bold"), axis.title.y = element_text(size = 20, face = "bold"), legend.text = element_text(size = 14), legend.title = element_text(size = 14, face = "bold"))
+```
+
+## R: Normalize within a batch
+Here, mean read depths are normalized across samples within a single batch. Normalized read depths of each Strain in drug-treated conditions are further normalized to their corresponding read depth in control conditions (i.e., YPD, DMSO, YPEG) to determine Strain fitness values. In this case, read depths are normalized within batch, and not across batches 
+
+```{r}
+#Read in raw counts data
+bwa_counts <- read_csv('Raw_Counts.csv')
+
+#Pivot to long format. Note, change the cols option to reflect the number of columns in the batch dataset
+bwa_counts_normalized <- bwa_counts %>% 
+    pivot_longer(cols = 2:137, names_to = "Pool", values_to = "Read_Depth") 
+
+#Create column indicating which drug treatment each replicate belongs to
+bwa_counts_normalized <- bwa_counts_normalized %>%
+  mutate(Condition = str_extract(Pool, "^[^_]+"))
+
+#Calculate mean of each strain/condition for normalized read depth and remove duplicates
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  group_by(Condition, Strain) %>% 
+  mutate(Mean_Depth_Strain_Condition = mean(Read_Depth))
+
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  select(Strain, Condition, Mean_Depth_Strain_Condition) %>% 
+  distinct()
+
+#Filter out strains with low read depth in control condition (e.g., YPD). Note: Change control condition below to reflect the specific sample control within batch (i.e., YPD/DMSO/YPEG)
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  mutate(Mean_Depth_Strain_Condition = ifelse(Condition == "YPD" & Mean_Depth_Strain_Condition < 20, NA, Mean_Depth_Strain_Condition))
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  drop_na()
+
+#Normalize read depth of each drug treatment to mean read depth of control across all strains (e.g., YPD). Note: Change control condition below to reflect the specific sample control within batch (i.e., YPD/DMSO/YPEG)
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  ungroup() %>% 
+  group_by(Condition) %>% 
+  mutate(Mean_Depth_Condition = mean(Mean_Depth_Strain_Condition))
+
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+ ungroup() %>% 
+ mutate(Normalization_Factor_YPD_overall = Mean_Depth_Condition[Condition == "YPD"][1]/Mean_Depth_Condition) %>% 
+ mutate(Normalized_Depth_YPD_Overall = Normalization_Factor_YPD_overall * Mean_Depth_Strain_Condition)
+
+#Divide read depth of each strain by its read depth in control condition to determine strain fitness factor. Note: Change control condition below to reflect the specific sample control within batch (i.e., YPD/DMSO/YPEG)
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  ungroup() %>% 
+  group_by(Strain) %>% 
+  #When normalizing to whole YPD counts
+  mutate(Strain_Fitness = Normalized_Depth_YPD_Overall/Normalized_Depth_YPD_Overall[Condition == "YPD"][1]) 
+
+#Select and remove duplicates
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  select(Strain, Condition, Strain_Fitness)
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  distinct()
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  drop_na()
+
+#Save file
+write_csv(bwa_counts_normalized, 'Normalized_counts.csv')
+```
+
+## R: Scale samples across batches and estimate fitness
+Here, mean read depths are normalized across samples and across batches. Each batch is normalized by determining the median read depth of each control condition across batches. Then, normalized read depths of each strain in drug-treated conditions are further normalized to their corresponding read depth in control conditions (i.e., YPD, DMSO, YPEG) to determine strain fitness values. In this case, read depths are normalized across batches to reduce batch-effect bias. 
+
+```{r}
+#Read in raw counts information. This file should contain all samples across all batches
+bwa_counts <- read_csv('raw_counts.csv')
+
+# Calculate the median for each sample
+medians <- apply(bwa_counts[, -1], 2, median)
+
+# Normalize each sample to the same median (e.g., median of medians)
+target_median <- median(medians)
+
+df_normalized_median <- bwa_counts %>%
+  mutate(across(-Strain, ~ . * (target_median / median(.))))
+
+#Sanity check for medians
+medians <- apply(df_normalized_median[, -1], 2, median)
+
+#Pivot to long format. Note, change cols option to reflect the number of columns in dataset
+bwa_counts_normalized <- df_normalized_total %>% 
+    pivot_longer(cols = 2:158, names_to = "Pool", values_to = "Read_Depth")
+
+#Create column indicating which treatment each sample belongs to
+bwa_counts_normalized <- bwa_counts_normalized %>%
+  mutate(Condition = str_extract(Pool, "^[^_]+")) 
+
+#Calculate mean of each strain/condition for normalized read depth and remove duplicates
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  group_by(Condition, Strain) %>% 
+  mutate(Mean_Depth_Strain_Condition = mean(Read_Depth))
+
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  select(Strain, Condition, Mean_Depth_Strain_Condition) %>% 
+  distinct()
+
+#Normalize read depth to YPD, DMSO and T = 0
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  ungroup() %>% 
+  group_by(Strain) %>% 
+  #When normalizing to whole YPD counts
+  mutate(Normalized_depth_YPD = Mean_Depth_Strain_Condition/Mean_Depth_Strain_Condition[Condition == "YPD"][1]) %>% 
+  mutate(Normalized_depth_SCD = Mean_Depth_Strain_Condition/Mean_Depth_Strain_Condition[Condition == "SCD"][1]) %>% 
+  mutate(Normalized_depth_YPD35 = Mean_Depth_Strain_Condition/Mean_Depth_Strain_Condition[Condition == "YPD35"][1]) %>% 
+  mutate(Normalized_depth_YPEGD = Mean_Depth_Strain_Condition/Mean_Depth_Strain_Condition[Condition == "YPEGD"][1]) %>% 
+  mutate(Normalized_depth_T = Mean_Depth_Strain_Condition/Mean_Depth_Strain_Condition[Condition == "T"][1]) %>% 
+  mutate(Normalized_depth_YPDNoDMSO = Mean_Depth_Strain_Condition/Mean_Depth_Strain_Condition[Condition == "YPDNoDMSO"][1]) 
+
+#Select and remove duplicates
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  select(Strain, Condition, Normalized_depth_YPD, Normalized_depth_YPEGD, Normalized_depth_SCD, Normalized_depth_YPD35, Normalized_depth_T, Normalized_depth_YPDNoDMSO)
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  distinct()
+bwa_counts_normalized <- bwa_counts_normalized %>% 
+  drop_na()
+
+#Normalize each treatment to their corresponding control condition and determine strain fitness values
+
+bwa_counts_normalized_condense <- bwa_counts_normalized %>%
+  mutate(Normalized_Fitness = ifelse(Condition == "ANT" | Condition == "OLI", Normalized_depth_YPEGD,
+                                     ifelse(Condition == "YPDNoDMSO" | Condition == "YPD", Normalized_depth_T, 
+                                            ifelse(Condition == "MMS0.0125" | Condition == "MMS0.025" | Condition == "YPEG", Normalized_depth_YPDNoDMSO,
+                                                   ifelse(Condition == "ETH" | Condition == "HYD" | Condition == "CAF", Normalized_depth_YPD35, Normalized_depth_YPD)))))
+
+bwa_counts_normalized_condense <- bwa_counts_normalized %>%
+  mutate(Normalized_Fitness = ifelse(Condition == "ANT" | Condition == "OLI", Normalized_depth_YPEGD,
+                                     ifelse(Condition == "YPDNoDMSO", Normalized_depth_T, 
+                                            ifelse(Condition == "YPEG", Normalized_depth_YPDNoDMSO,
+                                                   ifelse(Condition == "ETH" | Condition == "HYD" | Condition == "CAF", Normalized_depth_YPD35, Normalized_depth_YPD)))))
+
+bwa_counts_normalized_condense <- bwa_counts_normalized %>%
+  mutate(Normalized_Fitness = ifelse(Condition == "ANT" | Condition == "OLI", Normalized_depth_YPEGD,
+                                     ifelse(Condition == "YPDNoDMSO" | Condition == "YPD", Normalized_depth_T, 
+                                            ifelse(Condition == "YPEG", Normalized_depth_YPDNoDMSO,Normalized_depth_YPD))))
+                                                   
+bwa_counts_normalized_condense <- bwa_counts_normalized_condense %>% 
+  select(Strain, Condition, Normalized_Fitness)
+
+#Save file
+write_csv(bwa_counts_normalized_condense, 'Batch_Normalized_ReadDepth_counts.csv')
+```
+
+## R: Add phylogenetic annotations and plot one condition
+
+```{r}
+bwa_counts_normalized <- read_csv('Normalized_counts.csv')
+library(readxl)
+phylo <- read_xlsx('Additional File 1 - Supplemental Tables.xlsx', sheet = 1, skip 2)
+
+phylo <- phylo %>% 
+  select(Strain, `Phylogenetic Clade`)
+
+bwa_counts_normalized_phylo <- bwa_counts_normalized %>% 
+  left_join(phylo, by = "Strain")
+```
+
+## R: Prepare Strain-by-condition matrix
+
+```{r}
+#Identify outliers
+#Find outliers 
+is_outlier <- function(x) {
+  return(x < quantile(x, 0.25) - 1.5 * IQR(x) | x > quantile(x, 0.75) + 1.5 * IQR(x))
+}
+
+#Filter dataset for specific drug (replace X with compound name)
+bwa_counts_normalized_drug <- bwa_counts_normalized_phylo %>%
+  filter(Condition == "X") %>% 
+  drop_na()
+
+bwa_counts_normalized_drug <- bwa_counts_normalized_drug %>%
+  ungroup() %>% 
+  group_by(`Phylogenetic Clade`) %>% 
+  mutate('Outlier' = ifelse(is_outlier(Strain_Fitness), Strain, (NA)))
+
+# Convert 'group' column to a factor with specified levels
+bwa_counts_normalized_drug$`Phylogenetic Clade` <- factor(bwa_counts_normalized_drug$`Phylogenetic Clade`, levels = c(
+   "CHN", 
+  "Far East Asia", 
+  "Ecuadorian", 
+  "Mediterranean Oak", 
+  "Transpacific Oak", 
+  "Pacific West Coast Wine", 
+  "Wine/European",
+  "Prise de Mousse/Vin7", 
+  "Laboratory", 
+  "Beer 1/Mixed Origin",
+  "Mosaic"
+))
+
+#GGplot to visualize
+ggplot(bwa_counts_normalized_drug) +
+  aes(x = `Phylogenetic Clade`, y = Normalized_depth_YPD, fill = `Phylogenetic Clade`) +
+  geom_boxplot() +
+  theme_bw() +
+  scale_fill_manual(
+    values = c(
+     "Wine/European" = "#E07082",
+      "Pacific West Coast Wine" = "#61d04f",
+      "Transpacific Oak" = "#8F6249",
+      "Mosaic" = "#c7c7c7",
+      "CHN" = "#8c32bb",
+      "Beer 1/Mixed Origin" = "#f47c11",
+      "Ecuadorian" = "#85C9F1",
+      "Far East Asia" = "#6666FF",
+      "Mediterranean Oak" = "#b28a6e",
+      "Prise de Mousse/Vin7" = "#B24A5A",
+      "Laboratory" = "#FFB3FF")) +
+  ylab("Normalized Read Depth (Drug - DMSO)") + 
+  theme_classic() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1, size = 19, face = "bold"), axis.text.y = element_text(size = 19, face = "bold"), axis.title.x = element_blank(), axis.title.y = element_text(size = 19, face = "bold"), panel.grid.major = element_line(size = 0.5, linetype = 'dashed', color = 'grey'), panel.grid.minor = element_blank()) +
+    geom_signif(comparisons = list(c("Transpacific Oak", "Pacific West Coast Wine"),c("Transpacific Oak", "Wine/European"), c("Pacific West Coast Wine", "Wine/European")), test = "t.test", map_signif_level = T)
+```
+
+## R: Plot Strain-fitness heatmaps
+
+```{r}
+#Batch normalized
+bwa_counts_normalized_condense <- read_csv('Batch_Normalized_ReadDepth_counts.csv')
+
+phenotype <- bwa_counts_normalized_condense %>% 
+    rename("Compound" = "Condition")
+    # Remove underscores
+phenotype$Compound <- gsub("_", "", phenotype$Compound)
+phenotype <- phenotype %>% 
+      select(Strain, Compound, Normalized_Fitness)
+
+#Pivot
+phenotype2 <- phenotype %>% 
+  pivot_wider(names_from = Compound_FullName, values_from = Normalized_Fitness)
+
+# Create a second dataframe with the rownames
+rownames_df <- phenotype2[[1]]  # Store the rownames in a separate vector
+
+# Remove the first column from the original dataframe
+df_matrix <- phenotype2[,-1]
+
+# Ensure that all values are numeric (double) and not lists
+df_matrix <- as.data.frame(lapply(df_matrix, function(x) as.numeric(unlist(x))), check.names = FALSE)
+
+# Convert the dataframe to a matrix
+matrix_df <- as.matrix(df_matrix)
+
+# Assign the rownames from the second dataframe to the matrix
+rownames(matrix_df) <- rownames_df
+
+# Check the data types
+str(matrix_df)  # Ensure that all data is numeric
+
+#Annotate Strains
+phylo <- read_xlsx('Additional File 1 - Supplemental Tables.xlsx', sheet = 1, skip = 2) %>% 
+  select(Strain, `Phylogenetic Clade`)
+
+annot_row <- phylo
+annot_row <- annot_row %>% 
+  column_to_rownames("Strain") %>% 
+  as.data.frame()
+
+ann_colors = list(
+    'Phylogenetic Clade'= c(
+      "Wine/European" = "#E07082",
+      "Pacific West Coast Wine" = "#61d04f",
+      "Transpacific Oak" = "#8F6249",
+      "Mosaic" = "#c7c7c7",
+      "CHN" = "#8c32bb",
+      "Beer 1/Mixed Origin" = "#ffbe6fff",
+      "Ecuadorian" = "#85C9F1",
+      "Far East Asia" = "#6666FF",
+      "Mediterranean Oak" = "#b28a6e",
+      "Prise de Mousse/Vin7" = "#B24A5A",
+      "Laboratory" = "#FFB3FF"),
+    'Drug Category' = c(
+      "Amino Acid & Protein Stability" = "#8DD3C7",
+      "Cell Wall Stability" = "#FFFFB3",
+      "Lipid Synthesis" = "#FB8072",
+      "Membrane Integrity & Function" = "#80B1D3",
+      "Iron Homeostasis" = "#FDB462",
+      "Microtubule Dynamics" = "#B3DE69",
+      "Respiration & Mitochondrial Dynamics" = "#FCCDE5",
+      "Nucleic Acid Metabolism & DNA Damage" = "#BEBADA",
+      "Oxidative Stress" = "#BC80BD",
+      "Signal Transduction" = "#CCEBC5"
+    ))
+
+drugs <- read_xlsx('Additional File 1 - Supplemental Tables.xlsx', sheet = 2, skip = 2)
+#Drug Category
+drugs <- drugs %>% 
+  select(`Drug Category`, `Drug/Compound Name`)
+  
+#Drug Use
+#drugs <- drugs %>% 
+  #select(Uses, `Drug/Compound Name`)
+annot_col <- drugs %>% 
+  rename("Compound" = `Drug/Compound Name`) %>% 
+  drop_na()
+
+annot_col <- annot_col %>% 
+  column_to_rownames("Compound") %>% 
+  as.data.frame()
+
+#Z normalize
+your_data_z <- t(scale(t(matrix_df)))  # Scale each row (transpose to scale by column if needed)
+pheatmap(your_data_z, 
+         color = colorRampPalette(c("red", "white", "blue"))(100), 
+         annotation_row = annot_row,  # Use annotation_row for row annotations
+         kmeans_k = 5,
+         annotation_colors = ann_colors,
+         annotation_col = annot_col,
+         cluster_rows = TRUE,  # Ensure rows are clustered
+         cluster_cols = TRUE,  # Or TRUE, depending on your needs
+         show_rownames = FALSE,
+         fontsize = 12,  # Adjust overall font size
+         fontsize_row = 1,  # Increase font size for row labels
+         fontsize_col = 17,  # Increase font size for column labels
+         filename = "~/Documents/Measday_Lab/Graduate/Projects/Thesis/Barcoding_Project/BarSeq Paper/Figures/Supplemental_Fig_6-heatmap/Supplemental_Fig_6-heatmap.pdf", 
+         width = 18,
+         height = 12)
+
+p <- pheatmap(your_data_z, 
+              color = colorRampPalette(c("red", "white", "blue"))(100), 
+              fontsize_row = 0, 
+              annotation_row = annot_row, 
+              annotation_colors = ann_colors,
+              annotation_col = annot_col,
+              cluster_rows = TRUE, 
+              cluster_cols = TRUE, 
+              show_rownames = FALSE,  
+              width = 11,
+              height = 7)
+```
+
+
